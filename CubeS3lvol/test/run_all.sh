@@ -309,7 +309,7 @@ if [ "${MODE}" = list ]; then
 	echo "offline tools:       s3_bucket_selftest isa_baseline rpc_py38_compat replay_registry"
 	echo "offline integration: spawner thread_bounce journal wal cache flush export"
 	echo "                     statefile local_dev checkpoint export_swap export_read"
-	echo "                     copy_xml pending_persist active_nsid"
+	echo "                     copy_xml pending_persist active_nsid compress"
 	echo "with S3:             s3_client_test s3_bs_dev_test"
 	echo "dataplane:           dataplane recovery snapshot export srcdel selfimport shared_chain import_fanout"
 	echo "                     derived decouple_queue snapshot_cancel snapshot_converge"

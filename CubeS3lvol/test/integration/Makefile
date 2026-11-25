@@ -76,7 +76,7 @@ APPS = s3_client_test s3_spawner_test s3_thread_bounce_test s3_bs_dev_test \
        s3_export_read_test s3_preheat_test s3_copy_xml_test \
        s3_pending_persist_test s3_active_nsid_test s3_writeback_test \
        s3_dynamic_json_test s3_bstore_test s3_registry_persist_test \
-       s3_owner_test s3_nvmf_state_test
+       s3_owner_test s3_nvmf_state_test s3_compress_test
 
 # (a) minimal library set for the stubbed path
 STUB_SRCS      = spdk_thread_stub.c
@@ -102,7 +102,7 @@ BLOB_PC        = $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" \
 BLOB_SPDK_LIBS = $(call spdk_only_libs,$(BLOB_PC))
 BLOB_DPDK_ARGS = $(call dpdk_link_args,$(BLOB_PC))
 
-TEST_SYS_LIBS  = $(OPENSSL_STATIC_LIBS) -pthread -lrt -luuid -lm -ldl
+TEST_SYS_LIBS  = $(OPENSSL_STATIC_LIBS) $(S3LVOL_COMPRESS_LIBS) -pthread -lrt -luuid -lm -ldl
 
 .PHONY: all clean check
 
@@ -122,6 +122,13 @@ s3_client_test: s3_client_test.c $(STUB_SRCS) $(S3BSDEV_DIR)/libs3bsdev.a
 
 s3_spawner_test: s3_spawner_test.c $(STUB_SRCS) $(S3BSDEV_DIR)/libs3bsdev.a
 	$(CC) $(COMMON_CFLAGS) s3_spawner_test.c $(STUB_SRCS) \
+	    $(S3BSDEV_DIR)/libs3bsdev.a \
+	    $(AWS_LIBS) \
+	    -Wl,--start-group $(STUB_SPDK_LIBS) -Wl,--end-group \
+	    $(TEST_SYS_LIBS) -o $@
+
+s3_compress_test: s3_compress_test.c $(STUB_SRCS) $(S3BSDEV_DIR)/libs3bsdev.a
+	$(CC) $(COMMON_CFLAGS) -I$(S3BSDEV_DIR) s3_compress_test.c $(STUB_SRCS) \
 	    $(S3BSDEV_DIR)/libs3bsdev.a \
 	    $(AWS_LIBS) \
 	    -Wl,--start-group $(STUB_SPDK_LIBS) -Wl,--end-group \
@@ -385,7 +392,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_cach
        s3_checkpoint_test s3_export_swap_test s3_export_read_test s3_preheat_test \
        s3_copy_xml_test s3_pending_persist_test s3_active_nsid_test \
        s3_writeback_test s3_dynamic_json_test s3_bstore_test \
-       s3_registry_persist_test s3_owner_test s3_nvmf_state_test
+       s3_registry_persist_test s3_owner_test s3_nvmf_state_test s3_compress_test
 	./s3_spawner_test
 	./s3_thread_bounce_test
 	./s3_journal_test
@@ -408,6 +415,7 @@ check: s3_spawner_test s3_thread_bounce_test s3_journal_test s3_wal_test s3_cach
 	./s3_registry_persist_test
 	./s3_owner_test
 	./s3_nvmf_state_test
+	./s3_compress_test
 
 .PHONY: $(S3BSDEV_DIR)/libs3bsdev.a
 $(S3BSDEV_DIR)/libs3bsdev.a:

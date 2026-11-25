@@ -27,6 +27,7 @@
 
 #include "s3lvol/s3_client.h"
 #include "s3lvol/s3_spawner.h"
+#include "s3_compress.h"
 #include "s3_copy_xml.h"
 
 /* ==========================================================================
@@ -154,6 +155,15 @@ struct s3_request {
 	/* true for s3_get_range() (callback carries a byte count), false for
 	 * every other op. Selects which arm of ->cb to invoke. */
 	bool                             is_get;
+
+	/* Chunk-object compression (s3_compress.h). GET: the whole object is
+	 * fetched into zbuf, then decoded and the asked range copied to ->buf.
+	 * lz4/raw_len come from the object metadata (GET) or are set for it (PUT). */
+	bool                             whole;
+	bool                             lz4;
+	uint64_t                         raw_len;
+	size_t                           put_len;
+	struct aws_byte_buf              zbuf;
 
 	/* SPDK thread that submitted the request, captured at submit time.
 	 *
@@ -666,6 +676,14 @@ s3_crt_global_init(uint32_t event_loop_threads)
 		return -EIO;
 	}
 
+	if (ctx.rc == 0) {
+		int rc = s3c_init();
+
+		if (rc != 0) {
+			s3_crt_global_fini();
+			return rc;
+		}
+	}
 	return ctx.rc;
 }
 
@@ -735,6 +753,8 @@ s3_crt_global_fini(void)
 	if (!g_app_ctx_initialized) {
 		return;
 	}
+
+	s3c_fini();
 
 	/* Tear down on the spawner when one is available.
 	 *
@@ -1175,6 +1195,138 @@ s3_get_body_callback(struct aws_s3_meta_request *meta_request,
 	return AWS_OP_SUCCESS;
 }
 
+/* ==========================================================================
+ * Compressed chunk objects (s3_compress.h)
+ * ========================================================================== */
+
+static const struct aws_byte_cursor g_codec_header_name =
+	AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL("x-amz-meta-s3lvol-codec");
+static const struct aws_byte_cursor g_rawlen_header_name =
+	AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL("x-amz-meta-s3lvol-rawlen");
+
+/* Chunk objects are a few MiB at most; this only bounds a bogus header. */
+#define S3C_MAX_RAW_LEN (64ull << 20)
+
+static int
+s3_get_whole_headers_callback(struct aws_s3_meta_request *meta_request,
+			      const struct aws_http_headers *headers,
+			      int response_status, void *user_data)
+{
+	struct s3_request *req = user_data;
+	struct aws_byte_cursor v;
+	char num[32];
+
+	(void)meta_request;
+	(void)response_status;
+	if (aws_http_headers_get(headers, g_codec_header_name, &v) != AWS_OP_SUCCESS) {
+		aws_reset_error();
+		return AWS_OP_SUCCESS;          /* raw object */
+	}
+	if (!aws_byte_cursor_eq_c_str_ignore_case(&v, "lz4")) {
+		SPDK_ERRLOG("GetObject %s: unknown codec '%.*s'\n", req->key_buf,
+			    (int)v.len, (const char *)v.ptr);
+		return aws_raise_error(AWS_ERROR_S3_CANCELED);
+	}
+	if (aws_http_headers_get(headers, g_rawlen_header_name, &v) != AWS_OP_SUCCESS ||
+	    v.len == 0 || v.len >= sizeof(num)) {
+		SPDK_ERRLOG("GetObject %s: lz4 object without a valid raw length\n",
+			    req->key_buf);
+		return aws_raise_error(AWS_ERROR_S3_CANCELED);
+	}
+	memcpy(num, v.ptr, v.len);
+	num[v.len] = '\0';
+	req->raw_len = strtoull(num, NULL, 10);
+	if (req->raw_len == 0 || req->raw_len > S3C_MAX_RAW_LEN) {
+		SPDK_ERRLOG("GetObject %s: bad raw length %s\n", req->key_buf, num);
+		return aws_raise_error(AWS_ERROR_S3_CANCELED);
+	}
+	if (aws_byte_buf_init(&req->zbuf, req->allocator, req->raw_len)) {
+		return AWS_OP_ERR;
+	}
+	req->lz4 = true;
+	return AWS_OP_SUCCESS;
+}
+
+/* Decoding is off: a byte range of an LZ4 object would be returned as if it
+ * were chunk data, so fail the read instead. */
+static int
+s3_get_ranged_headers_callback(struct aws_s3_meta_request *meta_request,
+			       const struct aws_http_headers *headers,
+			       int response_status, void *user_data)
+{
+	struct s3_request *req = user_data;
+	struct aws_byte_cursor v;
+
+	(void)meta_request;
+	(void)response_status;
+	if (aws_http_headers_get(headers, g_codec_header_name, &v) != AWS_OP_SUCCESS) {
+		aws_reset_error();
+		return AWS_OP_SUCCESS;
+	}
+	SPDK_ERRLOG("GetObject %s: object is %.*s-compressed but decoding is off "
+		    "(set S3LVOL_COMPRESS=decode or lz4)\n", req->key_buf,
+		    (int)v.len, (const char *)v.ptr);
+	return aws_raise_error(AWS_ERROR_S3_CANCELED);
+}
+
+/* Raw objects stream straight into the caller's buffer, clipped to the range
+ * asked for, exactly as a ranged GET would; lz4 ones are collected whole. */
+static int
+s3_get_whole_body_callback(struct aws_s3_meta_request *meta_request,
+			   const struct aws_byte_cursor *body,
+			   uint64_t range_start, void *user_data)
+{
+	struct s3_request *req = user_data;
+
+	if (!req->lz4) {
+		return s3_get_body_callback(meta_request, body, range_start, user_data);
+	}
+	if (req->zbuf.len + body->len > S3C_MAX_RAW_LEN) {
+		SPDK_ERRLOG("GetObject %s: compressed body too large\n", req->key_buf);
+		return aws_raise_error(AWS_ERROR_S3_CANCELED);
+	}
+	return aws_byte_buf_append_dynamic(&req->zbuf, body);
+}
+
+/* Worker thread (or inline when the queue refuses): decode, copy the range. */
+static void
+s3_get_decode(void *arg)
+{
+	struct s3_request *req = arg;
+	uint8_t *tmp = NULL;
+	uint8_t *dst;
+
+	if (req->offset == 0 && req->len >= req->raw_len) {
+		dst = req->buf;
+	} else {
+		tmp = aws_mem_acquire(req->allocator, req->raw_len);
+		dst = tmp;
+	}
+
+	if (!dst || s3c_decompress(req->zbuf.buffer, req->zbuf.len, dst, req->raw_len) != 0) {
+		SPDK_ERRLOG("GetObject %s: LZ4 decode failed (%zu -> %" PRIu64 ")\n",
+			    req->key_buf, req->zbuf.len, req->raw_len);
+		req->status = -EIO;
+		req->bytes_read = 0;
+	} else if (tmp) {
+		uint64_t n = 0;
+
+		if (req->offset < req->raw_len) {
+			n = spdk_min(req->len, req->raw_len - req->offset);
+			memcpy(req->buf, tmp + req->offset, n);
+		}
+		req->bytes_read = n;
+	} else {
+		req->bytes_read = req->raw_len;
+	}
+
+	if (tmp) {
+		aws_mem_release(req->allocator, tmp);
+	}
+	aws_byte_buf_clean_up(&req->zbuf);
+	s3_request_complete(req);
+}
+
 static void
 s3_get_finished(struct aws_s3_meta_request *meta_request,
 		const struct aws_s3_meta_request_result *result,
@@ -1199,6 +1351,14 @@ s3_get_finished(struct aws_s3_meta_request *meta_request,
 
 	/* Release CRT state before the callback may hop threads. */
 	aws_s3_meta_request_release(meta_request);
+
+	if (req->whole && req->lz4 && req->status == 0) {
+		if (s3c_submit(s3_get_decode, req) != 0) {
+			s3_get_decode(req);
+		}
+		return;
+	}
+	aws_byte_buf_clean_up(&req->zbuf);
 
 	s3_request_complete(req);
 }
@@ -1237,6 +1397,9 @@ s3_get_range(struct s3_client *client, const char *key,
 	req->cb_arg  = cb_arg;
 	req->is_get  = true;
 	req->owner_thread = spdk_get_thread();
+	/* A compressed object cannot serve a byte range, so chunk keys are read
+	 * whole and the range is cut out after decoding. */
+	req->whole   = s3c_decode_enabled() && s3c_key_is_chunk(key);
 
 	rc = s3_request_set_key(req, key);
 	if (rc) {
@@ -1248,7 +1411,9 @@ s3_get_range(struct s3_client *client, const char *key,
 		.type           = AWS_S3_META_REQUEST_TYPE_GET_OBJECT,
 		.user_data      = req,
 		.signing_config = &client->signing_config,
-		.body_callback  = s3_get_body_callback,
+		.headers_callback = req->whole ? s3_get_whole_headers_callback
+					      : s3_get_ranged_headers_callback,
+		.body_callback  = req->whole ? s3_get_whole_body_callback : s3_get_body_callback,
 		.finish_callback = s3_get_finished,
 	};
 
@@ -1279,7 +1444,9 @@ s3_get_range(struct s3_client *client, const char *key,
 		 offset, offset + len - 1);
 	range_header.name  = aws_byte_cursor_from_c_str("Range");
 	range_header.value = aws_byte_cursor_from_c_str(range_hdr);
-	aws_http_message_add_header(options.message, range_header);
+	if (!req->whole) {
+		aws_http_message_add_header(options.message, range_header);
+	}
 
 	S3_STAT_INC(client, inflight);
 
@@ -1346,6 +1513,134 @@ s3_put_finished(struct aws_s3_meta_request *meta_request,
 	s3_request_complete(req);
 }
 
+/* Build and start the PUT for req->buf[0, put_len). On failure nothing has
+ * been started and the caller still owns req and req->buf. */
+static int
+s3_put_submit(struct s3_request *req)
+{
+	struct s3_client *client = req->client;
+	char content_length_str[32];
+	char raw_len_str[32];
+	int rc;
+
+	struct aws_s3_meta_request_options options = {
+		.type            = AWS_S3_META_REQUEST_TYPE_PUT_OBJECT,
+		.user_data       = req,
+		.signing_config  = &client->signing_config,
+		.finish_callback = s3_put_finished,
+	};
+
+	options.message = aws_http_message_new_request(req->allocator);
+	if (!options.message) {
+		return -ENOMEM;
+	}
+
+	s3_set_common_headers(options.message, client);
+
+	/* Content-Length */
+	snprintf(content_length_str, sizeof(content_length_str), "%zu", req->put_len);
+	struct aws_http_header cl_header = {
+		.name  = g_content_length_header_name,
+		.value = aws_byte_cursor_from_c_str(content_length_str),
+	};
+	aws_http_message_add_header(options.message, cl_header);
+
+	/* If-None-Match for create-once protection  */
+	if (req->if_none_match) {
+		struct aws_http_header inm_header = {
+			.name  = aws_byte_cursor_from_c_str("If-None-Match"),
+			.value = aws_byte_cursor_from_c_str("*"),
+		};
+		aws_http_message_add_header(options.message, inm_header);
+	}
+
+	if (req->lz4) {
+		struct aws_http_header codec_header = {
+			.name  = g_codec_header_name,
+			.value = aws_byte_cursor_from_c_str("lz4"),
+		};
+		snprintf(raw_len_str, sizeof(raw_len_str), "%" PRIu64, req->raw_len);
+		struct aws_http_header raw_header = {
+			.name  = g_rawlen_header_name,
+			.value = aws_byte_cursor_from_c_str(raw_len_str),
+		};
+		aws_http_message_add_header(options.message, codec_header);
+		aws_http_message_add_header(options.message, raw_header);
+	}
+
+	aws_http_message_set_request_method(options.message, aws_http_method_put);
+	rc = s3_set_request_path(options.message, req->allocator,
+				 client, req->key);
+	if (rc != AWS_OP_SUCCESS) {
+		aws_http_message_release(options.message);
+		return -ENOMEM;
+	}
+
+	/* Body stream */
+	if (req->put_len > 0 && req->buf) {
+		struct aws_byte_cursor body_cursor =
+			aws_byte_cursor_from_array(req->buf, req->put_len);
+		struct aws_input_stream *stream =
+			aws_input_stream_new_from_cursor(req->allocator, &body_cursor);
+		if (!stream) {
+			SPDK_ERRLOG("PutObject: failed to create body stream for key=%s\n",
+				    req->key_buf);
+			aws_http_message_release(options.message);
+			return -ENOMEM;
+		}
+		aws_http_message_set_body_stream(options.message, stream);
+		aws_input_stream_release(stream);
+	}
+
+	S3_STAT_INC(client, inflight);
+
+	struct aws_s3_meta_request *meta_req =
+		aws_s3_client_make_meta_request(client->aws_client, &options);
+	aws_http_message_release(options.message);
+
+	if (!meta_req) {
+		SPDK_ERRLOG("PutObject: failed to create meta request for key=%s: %s\n",
+			    req->key_buf, aws_error_str(aws_last_error()));
+		S3_STAT_DEC(client, inflight);
+		return -EIO;
+	}
+	/* Do NOT touch req past this point. */
+
+	return 0;
+}
+
+/* Worker thread: replace the body with its LZ4 form when that is smaller,
+ * then submit. Errors go to the caller's callback. */
+static void
+s3_put_compress_work(void *arg)
+{
+	struct s3_request *req = arg;
+	size_t cap = s3c_bound(req->put_len);
+	uint8_t *z = aws_mem_acquire(req->allocator, cap);
+	int n = z ? s3c_compress(req->buf, req->put_len, z, cap) : -1;
+	int rc;
+
+	if (n > 0) {
+		aws_mem_release(req->allocator, req->buf);
+		req->buf = z;
+		req->raw_len = req->put_len;
+		req->put_len = (size_t)n;
+		req->lz4 = true;
+	} else if (z) {
+		aws_mem_release(req->allocator, z);
+	}
+
+	rc = s3_put_submit(req);
+	if (rc) {
+		req->status = rc;
+		if (req->buf) {
+			aws_mem_release(req->allocator, req->buf);
+			req->buf = NULL;
+		}
+		s3_request_complete(req);
+	}
+}
+
 int
 s3_put(struct s3_client *client, const char *key,
        struct iovec *iov, int iovcnt, bool if_none_match,
@@ -1354,7 +1649,6 @@ s3_put(struct s3_client *client, const char *key,
 	struct s3_request *req;
 	size_t total_size = 0;
 	size_t body_pos;
-	char content_length_str[32];
 	int rc;
 
 	if (!client || !key || !iov || iovcnt <= 0 || !cb) {
@@ -1404,90 +1698,23 @@ s3_put(struct s3_client *client, const char *key,
 		body_buf.len = total_size;
 		req->buf = body_buf.buffer;
 	}
+	req->put_len = total_size;
 
-	struct aws_s3_meta_request_options options = {
-		.type            = AWS_S3_META_REQUEST_TYPE_PUT_OBJECT,
-		.user_data       = req,
-		.signing_config  = &client->signing_config,
-		.finish_callback = s3_put_finished,
-	};
+	/* Chunk objects are compressed on a worker, which then submits. From here
+	 * on a failure is reported through the callback, not the return value. */
+	if (total_size >= 4096 && s3c_enabled() && s3c_key_is_chunk(key) &&
+	    s3c_submit(s3_put_compress_work, req) == 0) {
+		return 0;
+	}
 
-	options.message = aws_http_message_new_request(client->app_ctx->allocator);
-	if (!options.message) {
+	rc = s3_put_submit(req);
+	if (rc) {
 		if (req->buf) {
 			aws_mem_release(client->app_ctx->allocator, req->buf);
 		}
 		aws_mem_release(client->app_ctx->allocator, req);
-		return -ENOMEM;
 	}
-
-	s3_set_common_headers(options.message, client);
-
-	/* Content-Length */
-	snprintf(content_length_str, sizeof(content_length_str), "%zu", total_size);
-	struct aws_http_header cl_header = {
-		.name  = g_content_length_header_name,
-		.value = aws_byte_cursor_from_c_str(content_length_str),
-	};
-	aws_http_message_add_header(options.message, cl_header);
-
-	/* If-None-Match for create-once protection  */
-	if (if_none_match) {
-		struct aws_http_header inm_header = {
-			.name  = aws_byte_cursor_from_c_str("If-None-Match"),
-			.value = aws_byte_cursor_from_c_str("*"),
-		};
-		aws_http_message_add_header(options.message, inm_header);
-	}
-
-	aws_http_message_set_request_method(options.message, aws_http_method_put);
-	rc = s3_set_request_path(options.message, client->app_ctx->allocator,
-				 client, req->key);
-	if (rc != AWS_OP_SUCCESS) {
-		aws_http_message_release(options.message);
-		if (req->buf) {
-			aws_mem_release(client->app_ctx->allocator, req->buf);
-		}
-		aws_mem_release(client->app_ctx->allocator, req);
-		return -ENOMEM;
-	}
-
-	/* Body stream */
-	if (total_size > 0 && req->buf) {
-		struct aws_byte_cursor body_cursor =
-			aws_byte_cursor_from_array(req->buf, total_size);
-		struct aws_input_stream *stream =
-			aws_input_stream_new_from_cursor(client->app_ctx->allocator, &body_cursor);
-		if (!stream) {
-			SPDK_ERRLOG("PutObject: failed to create body stream for key=%s\n", key);
-			aws_http_message_release(options.message);
-			aws_mem_release(client->app_ctx->allocator, req->buf);
-			aws_mem_release(client->app_ctx->allocator, req);
-			return -ENOMEM;
-		}
-		aws_http_message_set_body_stream(options.message, stream);
-		aws_input_stream_release(stream);
-	}
-
-	S3_STAT_INC(client, inflight);
-
-	struct aws_s3_meta_request *meta_req =
-		aws_s3_client_make_meta_request(client->aws_client, &options);
-	aws_http_message_release(options.message);
-
-	if (!meta_req) {
-		SPDK_ERRLOG("PutObject: failed to create meta request for key=%s: %s\n",
-			    key, aws_error_str(aws_last_error()));
-		S3_STAT_DEC(client, inflight);
-		if (req->buf) {
-			aws_mem_release(client->app_ctx->allocator, req->buf);
-		}
-		aws_mem_release(client->app_ctx->allocator, req);
-		return -EIO;
-	}
-	/* Do NOT touch req past this point. */
-
-	return 0;
+	return rc;
 }
 
 /* ==========================================================================

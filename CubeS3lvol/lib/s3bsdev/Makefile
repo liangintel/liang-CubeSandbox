@@ -29,7 +29,14 @@ SRCS = s3_bs_dev.c \
        s3_export.c \
        s3_export_ref.c \
        s3_get_budget.c \
+       s3_compress.c \
        s3_client_aws.c
+
+# S3LVOL_QAT=1 adds the QAT LZ4 path (qatlib); liblz4 is always the fallback.
+ifeq ($(S3LVOL_QAT),1)
+SRCS += s3_qat_lz4.c
+COMMON_CFLAGS += -DS3LVOL_WITH_QAT
+endif
 
 OBJS = $(SRCS:.c=.o)
 PIC_OBJS = $(SRCS:.c=.pic.o)
@@ -45,6 +52,8 @@ lib$(LIBNAME).so: $(PIC_OBJS)
 	$(CC) $(COMMON_CFLAGS) -shared $^ $(AWS_LIBS) -o $@
 
 lib$(LIBNAME).a: $(OBJS)
+	@# Recreated, not updated: S3LVOL_QAT=0 must drop s3_qat_lz4.o from it.
+	rm -f $@
 	$(AR) rcs $@ $^
 
 %.pic.o: %.c

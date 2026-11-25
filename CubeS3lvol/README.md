@@ -229,6 +229,36 @@ itself), and the only capability `--no-huge` drops is "DPDK resolving IOVAs for
 memory". Setting it to `0` switches to hugepages, in which case the script fails
 outright rather than silently degrading if `nr_hugepages=0`.
 
+### Chunk-object compression (optional)
+
+Chunk objects (`<lvs>/data/<uuid>` and `<lvs>/exports/<uuid>/<idx>`) can be
+stored LZ4-compressed. Manifests, checkpoints and every other key stay raw. The
+S3 client does the work, so the rest of s3lvol still sees raw chunk bytes. Set
+these in the environment of `s3lvol_tgt` (for example, before running
+`rcow_start.sh`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `S3LVOL_COMPRESS` | `none` | `lz4` compresses new chunk objects; `decode` reads compressed objects but writes raw; `none` reads raw objects only |
+| `S3LVOL_COMPRESS_QAT` | `0` | `1` offloads to Intel QAT through qatlib, with liblz4 as the fallback; needs a `S3LVOL_QAT=1` build |
+| `S3LVOL_COMPRESS_THREADS` | `4` | worker threads, started through the spawner so they avoid the reactor cores |
+| `S3LVOL_COMPRESS_STATS_FILE` | unset | counters, rewritten once a second |
+
+A compressed object carries `x-amz-meta-s3lvol-codec: lz4` and
+`x-amz-meta-s3lvol-rawlen`. An object without these headers is read as raw, so
+lvstores written before compression was turned on stay readable. If a chunk
+does not compress to fewer bytes than the original, it is stored raw.
+
+Upgrade order matters. A build without this feature, or one running with
+`S3LVOL_COMPRESS=none`, cannot read compressed chunks; `none` refuses them
+instead of returning the compressed bytes. Roll every node that can read an
+lvstore or its exports to `decode` first, and switch writers to `lz4` only
+after that.
+
+Building with QAT: install qatlib (`libqat`, `libusdm`, and their headers) and
+build with `make S3LVOL_QAT=1`. liblz4 (`lz4-devel` / `liblz4-dev`) is needed
+either way.
+
 ## Operations
 
 All of this project's RPCs go through `scripts/s3lvol_rpc.py` (raw JSON-RPC);

@@ -109,6 +109,7 @@ RUN . /etc/buildenv \
         libiscsi-dev \
         libjson-c-dev \
         libkeyutils-dev \
+        liblz4-dev \
         libncurses5-dev \
         libncursesw5-dev \
         libnuma-dev \

@@ -305,7 +305,8 @@ endif
 # Directories add the dependency with one line, `$(OBJS): $(S3LVOL_BUILD_STAMP)`,
 # leaving their own rules untouched.
 # ---------------------------------------------------------------------------
-S3LVOL_BUILD_STAMP := $(S3LVOL_ROOT)/.build-$(s3lvol_bt)
+# S3LVOL_QAT=1 changes what lib/s3bsdev compiles, so it is part of the stamp.
+S3LVOL_BUILD_STAMP := $(S3LVOL_ROOT)/.build-$(s3lvol_bt)$(if $(filter 1,$(S3LVOL_QAT)),-qat)
 
 $(S3LVOL_BUILD_STAMP):
 	@rm -f $(S3LVOL_ROOT)/.build-*
@@ -476,6 +477,13 @@ OPENSSL_ZLIB := $(shell nm -u $(OPENSSL_LIBDIR)/libcrypto.a 2>/dev/null \
         | grep -qw inflate && echo -lz)
 OPENSSL_STATIC_LIBS := $(OPENSSL_LIBDIR)/libssl.a $(OPENSSL_LIBDIR)/libcrypto.a \
         $(OPENSSL_ZLIB)
+endif
+
+# Chunk-object compression (lib/s3bsdev/s3_compress.c): liblz4 always, and with
+# S3LVOL_QAT=1 the Intel QAT path through qatlib.
+S3LVOL_COMPRESS_LIBS := -llz4
+ifeq ($(S3LVOL_QAT),1)
+S3LVOL_COMPRESS_LIBS += -lqat -lusdm
 endif
 
 # $(call dpdk_link_args,<pkg-config --libs output>) -- the DPDK half, ready to

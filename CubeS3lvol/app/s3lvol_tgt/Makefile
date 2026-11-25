@@ -99,6 +99,7 @@ $(APP): s3lvol_tgt.c $(MODULE_DIR)/libs3lvol_bdev.a $(S3BSDEV_DIR)/libs3bsdev.a
 	    -Wl,--no-whole-archive \
 	    $(AWS_LIBS) \
 	    $(OPENSSL_STATIC_LIBS) \
+	    $(S3LVOL_COMPRESS_LIBS) \
 	    $(SYS_LIBS) -pthread -lrt -luuid -lm -ldl -o $@
 
 # Both marked phony so the sub-makes always run: without that, an existing .a is
